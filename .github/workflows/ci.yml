@@ -1,0 +1,118 @@
+name: NGINX CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Security, build, and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      IMAGE: nginx-devops-demo:ci
+      TRIVY_IMAGE: aquasec/trivy:0.75.0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint Dockerfile
+        run: |
+          docker run --rm -i \
+            hadolint/hadolint:v2.15.1 < Dockerfile
+
+      - name: Scan source for secrets
+        run: |
+          docker run --rm \
+            -v "$PWD:/source:ro" \
+            "$TRIVY_IMAGE" fs \
+            --scanners secret \
+            --skip-dirs /source/.git \
+            --exit-code 1 \
+            /source
+
+      - name: Scan Dockerfile configuration
+        run: |
+          docker run --rm \
+            -v "$PWD:/source:ro" \
+            "$TRIVY_IMAGE" config \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            /source
+
+      - name: Build Docker image
+        run: docker build -t "$IMAGE" .
+
+      - name: Scan image vulnerabilities
+        run: |
+          docker save "$IMAGE" -o "$RUNNER_TEMP/nginx-image.tar"
+
+          docker run --rm \
+            -v "$RUNNER_TEMP:/scan:ro" \
+            "$TRIVY_IMAGE" image \
+            --input /scan/nginx-image.tar \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --exit-code 1
+
+      - name: Validate NGINX configuration
+        run: docker run --rm "$IMAGE" nginx -t
+
+      - name: Test running application
+        run: |
+          docker run -d \
+            --name nginx-ci \
+            --hostname nginx-ci \
+            -p 127.0.0.1:8080:8080 \
+            "$IMAGE"
+
+          curl --fail --silent --show-error \
+            --retry 10 --retry-connrefused --retry-delay 1 \
+            http://127.0.0.1:8080/health \
+            -o "$RUNNER_TEMP/health.txt"
+
+          test "$(cat "$RUNNER_TEMP/health.txt")" = "healthy"
+
+          python3 - <<'PY'
+          import datetime
+          import ipaddress
+          import urllib.request
+
+          with urllib.request.urlopen(
+              "http://127.0.0.1:8080/", timeout=5
+          ) as response:
+              assert response.status == 200
+              body = response.read().decode()
+
+          fields = dict(
+              line.split(": ", 1) for line in body.splitlines()
+          )
+          datetime.datetime.fromisoformat(fields["Date"])
+          ipaddress.ip_address(fields["IP"])
+          assert fields["Hostname"] == "nginx-ci"
+          print(body)
+          PY
+
+          test "$(docker exec nginx-ci id -u)" != "0"
+
+      - name: Show logs and clean up
+        if: always()
+        run: |
+          if docker container inspect nginx-ci >/dev/null 2>&1; then
+            docker logs nginx-ci
+            docker rm -f nginx-ci
+          fi
